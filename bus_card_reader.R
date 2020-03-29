@@ -6,6 +6,8 @@ library(purrr)
 library(dplyr)
 library(data.table)
 library(stringr)
+library(ngram)
+library(FeatureHashing)
 
 options(stringsAsFactors = FALSE)
 
@@ -28,6 +30,8 @@ company_table = fread("Lookup_Tables/7mm_companies.csv") %>%
 
 url_prefices = c("http://", "www.", "http://www.", "")
 
+table_size = 150e3
+
 company_table_reduce = 
   company_table %>%
   select(
@@ -36,69 +40,117 @@ company_table_reduce =
     Industry = industry
   ) %>%
   filter(
-    Website != "nan"
+    Company  != "nan",
+    Website  != "nan",
+    Industry != "nan"
   ) %>%
   mutate(
     Website = str_c(sample(url_prefices, 1, replace = T), 
                     Website)
+  ) %>%
+  slice(
+    sample(seq(nrow(.), table_size))
   )
 
-company_table_stacked_01 =
+company_table_stacked =
   company_table_reduce %>%
   pivot_longer(
     cols = everything(),
-    names_to = "Type",
-    values_to = "Text"
+    names_to = "type",
+    values_to = "text"
   )
 
-sample_size = 7e6
+sample_size = 50e3
 
 # Generate random names
 
 set.seed(1)
 
-TEST_PROP = 0.2
-
-random_names = 
-  data.frame(
-    Type = "Name",
-    Text = str_c(sample(forenames, sample_size, replace = T),
-                 " ",
-                 sample(surnames, sample_size, replace = T))
-  )
-  
-company_table_stacked_02 =
+info_table = 
   bind_rows(
-    company_table_stacked_01,
-    random_names
-  )
-
-company_table_shuffle =
-  company_table_stacked_02 %>%
+    company_table_stacked,
+    data.frame(
+      type = "Name",
+      text = str_c(sample(forenames, sample_size, replace = T),
+                   " ",
+                   sample(surnames, sample_size, replace = T)
+      )
+    )
+  ) %>%
   slice(
-    sample(seq(nrow(.)),
-           nrow(.)
-           )
-    ) %>%
-  mutate(
-    train_no = row_number() %% (1/TEST_PROP)
+    sample(seq(nrow(.), nrow(.)))
   )
-  
-company_table_test =
-  lapply(seq(1/TEST_PROP),
-         function(i){
-           company_table_shuffle %>%
-             filter(
-               train_no == i - 1
-             ) %>%
-             select(
-               -train_no
-             )
-           }
-         )
-  
-  
-  
-  
-  
 
+# Convert labels to numbers
+
+groups = unique(info_table$type)
+
+VALID_PROP  = 0.2
+DATA_SIZE  = 1e5
+data_rows  = seq(DATA_SIZE)
+train_rows = seq(DATA_SIZE * (1 - VALID_PROP))
+valid_rows  = setdiff(data_rows, train_rows)
+
+info_table_label =
+  info_table %>%
+  slice(data_rows) %>%
+  mutate(
+    text = sapply(text, function(x) ngram::splitter(x, split.char = TRUE)),
+    type_num = match(type, groups) - 1
+  ) %>%
+  select(
+    -type
+  )
+
+# Hashing
+
+info_table_hash =
+  hashed.model.matrix(
+    ~split(text,
+           delim = " ",
+           type = "tf-idf"),
+    data = info_table_label,
+    hash.size = 2^16,
+    signed.hash = FALSE
+  )
+
+# Split into Training and Test Data
+
+dtrain = xgb.DMatrix(info_table_hash[train_rows,],
+                     label = info_table_label$type_num[train_rows])
+dvalid = xgb.DMatrix(info_table_hash[valid_rows,],
+                     label = info_table_label$type_num[valid_rows])
+watch = list(train = dtrain,
+             valid = dvalid)
+
+#### Gradient Boosting Model ####
+
+# XGBoost
+
+xgb_model = xgb.train(
+  nrounds     = 10,
+  max.depth   = 20,
+  eta         = 1,
+  nthread     = 12,
+  data        = dtrain,
+  num_class   = length(groups),
+  objective   = "multi:softmax",
+  watchlist   = watch,
+  eval_metric = "merror"
+)
+
+#CatBoost
+
+#LightGBM
+
+#### Validation ####
+
+pred = predict(xgb_model, dvalid)
+accuracy = mean(pred == info_table_label$type_num[valid_rows])
+
+errors =
+  data.frame(
+    text = info_table$text[valid_rows],
+    type_act = info_table$type[valid_rows],
+    type_pred = groups[pred + 1]
+  )[pred != info_table_label$type_num[valid_rows],]
