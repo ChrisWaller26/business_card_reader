@@ -8,6 +8,7 @@ library(data.table)
 library(stringr)
 library(ngram)
 library(FeatureHashing)
+library(jsonlite)
 
 options(stringsAsFactors = FALSE)
 
@@ -26,11 +27,31 @@ headings = c("Company", "Name", "Job_Title", "Industry",
 company_table = fread("Lookup_Tables/7mm_companies.csv") %>%
   as.data.frame()
 
+email_list = 
+  data.frame(
+    text = fread("Lookup_Tables/E_Mails.csv")[[1]],
+    type = "Email"
+  )
+
+job_titles = fromJSON("Lookup_Tables/cleaned_related_titles.json") %>%
+  pivot_longer(
+    cols = everything(),
+    values_to = "job_title"
+  ) %>%
+  select(
+    -name
+  ) %>%
+  filter(
+    !is.na(job_title)
+  ) %>%
+  distinct() 
+
 #### Process Training Data ####
 
 url_prefices = c("http://", "www.", "http://www.", "")
-
 table_size = 150e3
+sample_size = 50e3
+set.seed(1)
 
 company_table_reduce = 
   company_table %>%
@@ -47,9 +68,6 @@ company_table_reduce =
   mutate(
     Website = str_c(sample(url_prefices, 1, replace = T), 
                     Website)
-  ) %>%
-  slice(
-    sample(seq(nrow(.), table_size))
   )
 
 company_table_stacked =
@@ -58,13 +76,38 @@ company_table_stacked =
     cols = everything(),
     names_to = "type",
     values_to = "text"
+  ) %>%
+  sample_n(
+    table_size
+  ) %>%
+  bind_rows(
+    email_list
+  ) %>%
+  bind_rows(
+    data.frame(
+      text = job_titles$job_title,
+      type = "Job Title"
+    ) %>%
+      sample_n(
+        sample_size
+      )
   )
 
-sample_size = 50e3
+# Generate random phone numbers
+
+tel_suffix = c("+4401", "+44 01", "+44 1", "+44 (0)1", "+44-01", "+44-1", "+44-(0)1", "01",
+               "+4402", "+44 02", "+44 2", "+44 (0)2", "+44-02", "+44-2", "+44-(0)2", "02",
+               "+4407", "+44 07", "+44 7", "+44 (0)7", "+44-07", "+44-7", "+44-(0)7", "07")
+
+random_tel = str_c(sample(tel_suffix, sample_size, replace = T),
+                   sample(100:999, sample_size, replace = T),
+                   sample(c(" ", "-"), sample_size, replace = T),
+                   sample(100:999, sample_size, replace = T),
+                   sample(c("", " ", "-"), sample_size, replace = T),
+                   sample(100:999, sample_size, replace = T)
+                   )
 
 # Generate random names
-
-set.seed(1)
 
 info_table = 
   bind_rows(
@@ -75,10 +118,14 @@ info_table =
                    " ",
                    sample(surnames, sample_size, replace = T)
       )
-    )
-  ) %>%
-  slice(
-    sample(seq(nrow(.), nrow(.)))
+    ),
+    data.frame(
+      type = "Tel",
+      text = random_tel
+      )
+    ) %>%
+  sample_n(
+    nrow(.)
   )
 
 # Convert labels to numbers
@@ -129,9 +176,9 @@ watch = list(train = dtrain,
 
 xgb_model = xgb.train(
   nrounds     = 10,
-  max.depth   = 20,
+  max.depth   = 10,
   eta         = 1,
-  nthread     = 12,
+  nthread     = 6,
   data        = dtrain,
   num_class   = length(groups),
   objective   = "multi:softmax",
@@ -145,12 +192,70 @@ xgb_model = xgb.train(
 
 #### Validation ####
 
-pred = predict(xgb_model, dvalid)
-accuracy = mean(pred == info_table_label$type_num[valid_rows])
+info_table_summary =
+  info_table %>%
+  group_by(
+    type
+  ) %>%
+  summarise(
+    count = n()
+  )
 
-errors =
+pred = predict(xgb_model, dvalid)
+
+model_output = 
   data.frame(
     text = info_table$text[valid_rows],
     type_act = info_table$type[valid_rows],
     type_pred = groups[pred + 1]
-  )[pred != info_table_label$type_num[valid_rows],]
+    )
+
+accuracy = mean(pred == info_table_label$type_num[valid_rows])
+
+accuracy_summary =
+  model_output %>%
+  group_by(
+    type_act,
+    type_pred
+  ) %>%
+  summarise(
+    count = n()
+    ) %>%
+  ungroup() %>%
+  group_by(
+    type_act
+  ) %>%
+  mutate(
+    count_type = sum(count),
+    acc = count / count_type,
+    percent = 
+      str_c(round(acc * 100, 1), "%")
+  ) %>%
+  ungroup() %>%
+  complete(
+    type_act,
+    type_pred,
+    fill = list(percent = "0%")
+  ) %>%
+  select(
+    type_act,
+    type_pred,
+    percent
+  ) %>%
+  pivot_wider(
+    names_from = type_pred,
+    values_from = percent,
+    values_fil = list(percent = "0%")
+  ) %>%
+  arrange(
+    type_act
+  )
+
+errors =
+  model_output %>%
+  filter(
+    type_act != type_pred
+    ) %>%
+  arrange(
+    type_act
+  )
