@@ -9,3 +9,8 @@
 *.xlsx
 *.RProj
 *.json
+*.png
+*.jpg
+*.gif
+*.bmp
+catboost_info

@@ -1,5 +1,6 @@
 #### Load Pakcgaes ####
 
+library(reticulate)
 library(xgboost)
 library(tidyverse)
 library(purrr)
@@ -9,8 +10,13 @@ library(stringr)
 library(ngram)
 library(FeatureHashing)
 library(jsonlite)
+library(catboost)
 
 options(stringsAsFactors = FALSE)
+
+#### Split and Read Images Using Python ####
+
+reticulate::source_python("image_splitter.py")
 
 #### Import Datasets ####
 
@@ -187,6 +193,33 @@ xgb_model = xgb.train(
 )
 
 #CatBoost
+
+type_data = info_table_label %>%
+  transmute(
+    text = as.factor(text)
+    ) %>%
+  slice(train_rows)
+
+label_values = info_table_label$type_num[train_rows]
+
+fit_params <- list(iterations = 100,
+                   loss_function = 'Logloss',
+                   ignored_features = c(4,9),
+                   border_count = 32,
+                   depth = 5,
+                   learning_rate = 0.03,
+                   l2_leaf_reg = 3.5,
+                   task_type = 'GPU')
+
+pool = catboost.load_pool(type_data, 
+                          label = label_values, 
+                          cat_features = seq(length(groups)) - 1)
+
+model <- catboost.train(pool, params = fit_params)
+
+prediction <- catboost.predict(model, 
+                               pool, 
+                               prediction_type = 'RawFormulaVal')
 
 #LightGBM
 
